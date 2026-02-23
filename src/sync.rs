@@ -214,6 +214,11 @@ impl SyncServer {
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(err) => return Err(anyhow!("accept failed: {err}")),
             };
+            stream.set_nonblocking(false).ok();
+            stream.set_read_timeout(Some(Duration::from_millis(300))).ok();
+            stream
+                .set_write_timeout(Some(Duration::from_millis(300)))
+                .ok();
 
             let mut bytes = Vec::new();
             stream.read_to_end(&mut bytes)?;
@@ -236,10 +241,6 @@ impl SyncServer {
             if !self.security.verify_key(&req.auth_key) {
                 continue;
             }
-            incoming_updates.push(IncomingPeerUpdate {
-                peer: req.peer.clone(),
-                payload: req.payload.clone(),
-            });
 
             let client = SyncClient::new(&req.auth_key);
             let envelope = client.prepare_envelope(
@@ -250,6 +251,10 @@ impl SyncServer {
             );
             let encoded = client.encode_envelope(&envelope)?;
             stream.write_all(&encoded)?;
+            incoming_updates.push(IncomingPeerUpdate {
+                peer: req.peer.clone(),
+                payload: req.payload.clone(),
+            });
             served += 1;
         }
         let _ = served;

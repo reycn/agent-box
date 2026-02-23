@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::process;
 use std::thread;
 use std::time::Duration;
@@ -78,6 +79,8 @@ fn main() -> Result<()> {
     let mut local_store = RuntimeStateStore::default();
     let mut combined_store = RuntimeStateStore::default();
     let mut frame: usize = 0;
+    let mut remote_cache: HashMap<String, (agent_box::model::SessionEvent, u64)> = HashMap::new();
+    let mut known_peers: HashSet<String> = HashSet::new();
     let protocol = transport_from_args(args.protocol);
     let bind_ip = if prefer_public_ip {
         "0.0.0.0".to_string()
@@ -105,24 +108,26 @@ fn main() -> Result<()> {
     };
 
     loop {
+        let now_ms = unix_ms_now();
         local_store.clear();
         run_once(&mut local_store);
         let local_events = local_store.all();
         let local_events_snapshot = local_events.clone();
-        let mut pushed_from_peers = Vec::new();
 
         if let (Some(server), Some(key)) = (&sync_server, session_key.as_deref()) {
             if let Ok(incoming) = server.serve_once(
                 local_events.clone(),
                 &listen_ip,
-                unix_ms_now(),
+                now_ms,
                 protocol,
             ) {
                 for update in incoming {
+                    known_peers.insert(update.peer.clone());
                     for mut event in update.payload {
                         event.id = format!("remote:{}:{}", update.peer, event.id);
                         event.user = format!("{}@{}", event.user, update.peer);
-                        pushed_from_peers.push(event);
+                        event.updated_at_unix_ms = now_ms;
+                        remote_cache.insert(event.id.clone(), (event, now_ms));
                     }
                 }
             }
@@ -130,31 +135,52 @@ fn main() -> Result<()> {
             let _ = SyncClient::new(key).handshake(key);
         }
 
+        let mut pull_targets = known_peers.clone();
+        if let Some(host) = peer_host.as_ref() {
+            pull_targets.insert(host.clone());
+        }
+
+        if let Some(key) = session_key.as_deref() {
+            for target in pull_targets {
+                if target == listen_ip {
+                    continue;
+                }
+                let client = SyncClient::new(key);
+                if let Ok(remote) = client.pull_once(
+                    &target,
+                    args.port,
+                    key,
+                    &listen_ip,
+                    local_events_snapshot.clone(),
+                    Duration::from_millis(350),
+                ) {
+                    let source_peer = if remote.peer.trim().is_empty() {
+                        target.clone()
+                    } else {
+                        remote.peer.clone()
+                    };
+                    known_peers.insert(source_peer.clone());
+                    for mut event in remote.payload {
+                        // Namespace remote identity so local and remote sessions coexist.
+                        event.id = format!("remote:{}:{}", source_peer, event.id);
+                        event.user = format!("{}@{}", event.user, source_peer);
+                        event.updated_at_unix_ms = now_ms;
+                        remote_cache.insert(event.id.clone(), (event, now_ms));
+                    }
+                }
+            }
+        }
+
+        // Keep remote cache stable to avoid flicker, but prune stale entries.
+        let remote_ttl_ms = (tick_secs * 8 * 1000) as u64;
+        remote_cache.retain(|_, (_, seen_at)| now_ms.saturating_sub(*seen_at) <= remote_ttl_ms);
+
         combined_store.clear();
         for event in local_events {
             let _ = combined_store.upsert(event);
         }
-        for event in pushed_from_peers {
-            let _ = combined_store.upsert(event);
-        }
-
-        if let (Some(host), Some(key)) = (peer_host.as_deref(), session_key.as_deref()) {
-            let client = SyncClient::new(key);
-            if let Ok(remote) = client.pull_once(
-                host,
-                args.port,
-                key,
-                &listen_ip,
-                local_events_snapshot,
-                Duration::from_millis(350),
-            ) {
-                for mut event in remote.payload {
-                    // Prefix remote identity so local and remote sessions can coexist in one view.
-                    event.id = format!("remote:{}:{}", host, event.id);
-                    event.user = format!("{}@{}", event.user, host);
-                    let _ = combined_store.upsert(event);
-                }
-            }
+        for (event, _) in remote_cache.values() {
+            let _ = combined_store.upsert(event.clone());
         }
 
         // Clear screen and move cursor to top-left for live dashboard behavior.
@@ -163,7 +189,7 @@ fn main() -> Result<()> {
         if let Some(key) = &session_key {
             println!("Join by: agent-box {}:{}\n", listen_ip, key);
         } else {
-            println!("--- refresh @ {} ---\n", unix_ms_now());
+            println!("--- refresh @ {} ---\n", now_ms);
         }
         println!("{}", render_snapshot_with_frame(&combined_store, frame));
         frame = frame.wrapping_add(1);
