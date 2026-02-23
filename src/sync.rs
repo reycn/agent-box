@@ -1,3 +1,5 @@
+use std::io::{Read, Write};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -19,6 +21,11 @@ pub struct SyncEnvelope {
     pub nonce: u64,
     pub protocol: TransportProtocol,
     pub payload: Vec<SessionEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PullRequest {
+    auth_key: String,
 }
 
 #[derive(Debug, Clone)]
@@ -94,6 +101,103 @@ impl SyncClient {
         let envelope: SyncEnvelope = serde_json::from_slice(&plain)?;
         Ok(envelope)
     }
+
+    pub fn pull_once(
+        &self,
+        peer_host: &str,
+        port: u16,
+        auth_key: &str,
+        timeout: Duration,
+    ) -> Result<SyncEnvelope> {
+        self.handshake(auth_key)?;
+        let addr = resolve_addr(peer_host, port)?;
+        let mut stream = TcpStream::connect_timeout(&addr, timeout)
+            .map_err(|e| anyhow!("connect failed to {peer_host}:{port}: {e}"))?;
+        stream.set_read_timeout(Some(timeout)).ok();
+        stream.set_write_timeout(Some(timeout)).ok();
+
+        let request = PullRequest {
+            auth_key: auth_key.to_string(),
+        };
+        let request_bytes = serde_json::to_vec(&request)?;
+        stream.write_all(&request_bytes)?;
+        stream.shutdown(Shutdown::Write).ok();
+
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes)?;
+        if bytes.is_empty() {
+            return Err(anyhow!("empty sync response from peer"));
+        }
+        self.decode_envelope(&bytes)
+    }
+}
+
+pub struct SyncServer {
+    listener: TcpListener,
+    security: SecurityLayer,
+}
+
+impl SyncServer {
+    pub fn bind(ip: &str, port: u16, shared_key: &str) -> Result<Self> {
+        let listener =
+            TcpListener::bind(format!("{ip}:{port}")).map_err(|e| anyhow!("bind failed: {e}"))?;
+        listener.set_nonblocking(true)?;
+        Ok(Self {
+            listener,
+            security: SecurityLayer::new(shared_key),
+        })
+    }
+
+    pub fn serve_once(
+        &self,
+        local_events: Vec<SessionEvent>,
+        peer_name: &str,
+        nonce: u64,
+        protocol: TransportProtocol,
+    ) -> Result<usize> {
+        let mut served = 0usize;
+        loop {
+            let (mut stream, _) = match self.listener.accept() {
+                Ok(v) => v,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(err) => return Err(anyhow!("accept failed: {err}")),
+            };
+
+            let mut bytes = Vec::new();
+            stream.read_to_end(&mut bytes)?;
+            if bytes.is_empty() {
+                continue;
+            }
+            let req: PullRequest = match serde_json::from_slice(&bytes) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if !self.security.verify_key(&req.auth_key) {
+                continue;
+            }
+
+            let client = SyncClient::new(&req.auth_key);
+            let envelope = client.prepare_envelope(
+                peer_name.to_string(),
+                nonce,
+                protocol,
+                local_events.clone(),
+            );
+            let encoded = client.encode_envelope(&envelope)?;
+            stream.write_all(&encoded)?;
+            served += 1;
+        }
+        Ok(served)
+    }
+}
+
+fn resolve_addr(host: &str, port: u16) -> Result<SocketAddr> {
+    let mut resolved = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| anyhow!("resolve failed for {host}:{port}: {e}"))?;
+    resolved
+        .next()
+        .ok_or_else(|| anyhow!("no socket addresses for {host}:{port}"))
 }
 
 // Placeholder transport transform to model encrypted transport boundaries.
@@ -107,9 +211,12 @@ fn decrypt_like_transport(input: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+    use std::time::Duration;
+
     use crate::model::{AgentKind, SessionEvent, SessionStatus};
 
-    use super::{RetryPolicy, SyncClient, TransportProtocol};
+    use super::{RetryPolicy, SyncClient, SyncServer, TransportProtocol};
 
     #[test]
     fn handshake_rejects_invalid_key() {
@@ -150,6 +257,47 @@ mod tests {
         assert_eq!(policy.delay_for_attempt(1).as_millis(), 200);
         assert_eq!(policy.delay_for_attempt(2).as_millis(), 400);
         assert_eq!(policy.delay_for_attempt(10).as_millis(), 2_000);
+    }
+
+    #[test]
+    fn pull_once_gets_remote_payload() {
+        let server =
+            SyncServer::bind("127.0.0.1", 38466, "abc").expect("server should bind localhost");
+        let event = SessionEvent {
+            id: "remote".to_string(),
+            agent: AgentKind::Claude,
+            title: "title".to_string(),
+            working_dir: "/tmp".to_string(),
+            user: "u".to_string(),
+            status: SessionStatus::Running,
+            pending_action: None,
+            started_at_unix_ms: 1,
+            updated_at_unix_ms: 2,
+            last_lines: vec!["token=123".to_string()],
+        };
+
+        let handle = thread::spawn(move || {
+            for _ in 0..20 {
+                if server
+                    .serve_once(vec![event.clone()], "peer-a", 10, TransportProtocol::Http)
+                    .expect("serve ok")
+                    > 0
+                {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            panic!("server did not serve request");
+        });
+
+        thread::sleep(Duration::from_millis(20));
+        let client = SyncClient::new("abc");
+        let response = client
+            .pull_once("127.0.0.1", 38466, "abc", Duration::from_millis(300))
+            .expect("pull works");
+        assert_eq!(response.payload.len(), 1);
+        assert_eq!(response.payload[0].last_lines[0], "token=[REDACTED]");
+        handle.join().expect("server thread joins");
     }
 }
 

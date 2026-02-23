@@ -93,6 +93,10 @@ pub struct RuntimeStateStore {
 }
 
 impl RuntimeStateStore {
+    pub fn clear(&mut self) {
+        self.sessions.clear();
+    }
+
     pub fn upsert(&mut self, incoming: SessionEvent) -> bool {
         if let Some(existing) = self.sessions.get_mut(&incoming.id) {
             if incoming.updated_at_unix_ms < existing.updated_at_unix_ms {

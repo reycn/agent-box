@@ -124,7 +124,7 @@ fn collect_local_process_sessions() -> Vec<SessionEvent> {
             updated_at_unix_ms: now,
             last_lines: vec![
                 format!("pid={pid}"),
-                format!("cmd: {}", truncate_text(&command, 64)),
+                format!("cmd: {}", summarize_command(&command, 64)),
             ],
         });
     }
@@ -153,26 +153,48 @@ fn contains_exec_token(command: &str, needle: &str) -> bool {
 }
 
 fn title_from_command(command: &str) -> String {
-    let title = command.split_whitespace().take(5).collect::<Vec<_>>().join(" ");
-    truncate_text(&title, 48)
+    summarize_command(command, 48)
 }
 
-fn truncate_text(input: &str, limit: usize) -> String {
+fn summarize_command(command: &str, limit: usize) -> String {
+    let mut tokens = command.split_whitespace();
+    let exe = tokens.next().unwrap_or_default();
+    let exe_name = exe.rsplit('/').next().unwrap_or(exe);
+    let tail_args = tokens.collect::<Vec<_>>();
+
+    let summary = if tail_args.is_empty() {
+        exe_name.to_string()
+    } else {
+        let kept_tail = if tail_args.len() > 3 {
+            tail_args[tail_args.len() - 3..].join(" ")
+        } else {
+            tail_args.join(" ")
+        };
+        format!("{exe_name} {kept_tail}")
+    };
+
+    truncate_keep_right(&summary, limit)
+}
+
+fn truncate_keep_right(input: &str, limit: usize) -> String {
     if input.chars().count() <= limit {
         return input.to_string();
     }
     let take = limit.saturating_sub(3);
-    let mut out = String::new();
-    for c in input.chars().take(take) {
-        out.push(c);
-    }
-    out.push_str("...");
-    out
+    let tail: String = input
+        .chars()
+        .rev()
+        .take(take)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("...{tail}")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{detect_agent_kind, title_from_command};
+    use super::{detect_agent_kind, summarize_command, title_from_command};
     use crate::model::AgentKind;
 
     #[test]
@@ -189,9 +211,19 @@ mod tests {
     #[test]
     fn title_is_truncated() {
         let title = title_from_command(
-            "claude this is a very very very very very very long command string",
+            "/opt/tools/claude this is a very very very very very very long command string with extra tail",
         );
         assert!(title.len() <= 48);
+    }
+
+    #[test]
+    fn summarize_command_prefers_executable_and_tail() {
+        let s = summarize_command(
+            "/home/rongxin/.nvm/versions/node/v20.8.1/bin/node /a/b/c/d/e/f/g.js --foo --bar",
+            64,
+        );
+        assert!(s.contains("node"));
+        assert!(s.contains("--foo") || s.contains("--bar"));
     }
 }
 
