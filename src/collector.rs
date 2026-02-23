@@ -113,6 +113,14 @@ fn collect_local_process_sessions() -> Vec<SessionEvent> {
             continue;
         };
 
+        let last_lines = session_logs_from_command(&command).unwrap_or_else(|| {
+            vec![
+                format!("pid={pid}"),
+                format!("cmd: {}", summarize_command(&command, 64)),
+                "(no session logs)".to_string(),
+            ]
+        });
+
         sessions.push(SessionEvent {
             id: format!("proc-{pid}"),
             agent,
@@ -123,10 +131,7 @@ fn collect_local_process_sessions() -> Vec<SessionEvent> {
             pending_action: None,
             started_at_unix_ms: now,
             updated_at_unix_ms: now,
-            last_lines: vec![
-                format!("pid={pid}"),
-                format!("cmd: {}", summarize_command(&command, 64)),
-            ],
+            last_lines,
         });
     }
 
@@ -222,6 +227,102 @@ fn find_session_path_hint(tokens: &[String]) -> Option<String> {
 
 fn looks_like_path(token: &str) -> bool {
     token.contains('/') || token.contains('\\')
+}
+
+/// Tries to retrieve the last few lines of agent session output from a transcript/session file.
+/// Returns None if no session path is found, file is unreadable, or format is unsupported.
+fn session_logs_from_command(command: &str) -> Option<Vec<String>> {
+    let tokens = command
+        .split_whitespace()
+        .map(normalize_token)
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>();
+    let path = find_session_path_hint(&tokens)?;
+    extract_session_logs_from_file(&path)
+}
+
+fn extract_session_logs_from_file(path: &str) -> Option<Vec<String>> {
+    let p = Path::new(path);
+    if !p.exists() || !p.is_file() {
+        return None;
+    }
+    let content = std::fs::read_to_string(p).ok()?;
+    let lines: Vec<&str> = content.lines().rev().take(50).collect();
+    let mut out = Vec::with_capacity(2);
+    for line in lines.iter().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(text) = extract_content_from_jsonl_line(trimmed) {
+            let truncated = truncate_for_display(&text, 56);
+            if !truncated.is_empty() && !out.contains(&truncated) {
+                out.push(truncated);
+                if out.len() >= 2 {
+                    break;
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn extract_content_from_jsonl_line(line: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    let obj = v.as_object()?;
+    // Prefer assistant-type messages; skip user-only noise.
+    let msg_type = obj.get("type").and_then(|t| t.as_str());
+    if msg_type == Some("user") {
+        return None;
+    }
+    // Extract text from common fields.
+    if let Some(c) = obj.get("content") {
+        if let Some(s) = c.as_str() {
+            return Some(s.to_string());
+        }
+        if let Some(arr) = c.as_array() {
+            for item in arr.iter().rev() {
+                if let Some(block) = item.as_object() {
+                    if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
+                        return Some(t.to_string());
+                    }
+                }
+            }
+        }
+    }
+    if let Some(t) = obj.get("text").and_then(|v| v.as_str()) {
+        return Some(t.to_string());
+    }
+    if let Some(t) = obj.get("reasoning").and_then(|v| v.as_str()) {
+        return Some(t.to_string());
+    }
+    if let Some(t) = obj.get("message").and_then(|v| v.as_str()) {
+        return Some(t.to_string());
+    }
+    None
+}
+
+fn truncate_for_display(input: &str, limit: usize) -> String {
+    let s = input
+        .lines()
+        .next()
+        .unwrap_or(input)
+        .trim()
+        .replace('\n', " ");
+    if s.chars().count() <= limit {
+        return s.to_string();
+    }
+    let take = limit.saturating_sub(3);
+    let mut out = String::new();
+    for c in s.chars().take(take) {
+        out.push(c);
+    }
+    out.push_str("...");
+    out
 }
 
 fn read_title_from_session_file(path: &str) -> Option<String> {
@@ -387,6 +488,36 @@ mod tests {
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn session_logs_extracted_from_jsonl_when_present() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("agent-box-logs-{unique}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("session.jsonl");
+        let content = r#"{"type":"user","content":"fix the bug"}
+{"type":"assistant","content":"Inspecting the codebase now."}
+{"type":"assistant","content":"Applying patch to src/main.rs."}
+"#;
+        fs::write(&path, content).expect("write file");
+
+        let cmd = format!("claude --session {}", path.display());
+        let logs = super::session_logs_from_command(&cmd).expect("logs");
+        assert!(!logs.is_empty());
+        assert!(logs.iter().any(|l| l.contains("Inspecting") || l.contains("Applying")));
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn session_logs_fallback_when_no_path() {
+        let logs = super::session_logs_from_command("claude");
+        assert!(logs.is_none());
     }
 }
 

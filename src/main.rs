@@ -141,31 +141,42 @@ fn main() -> Result<()> {
         }
 
         if let Some(key) = session_key.as_deref() {
+            let pull_timeout = Duration::from_millis((tick_secs * 2 + 1) * 1000);
             for target in pull_targets {
                 if target == listen_ip {
                     continue;
                 }
                 let client = SyncClient::new(key);
-                if let Ok(remote) = client.pull_once(
-                    &target,
-                    args.port,
-                    key,
-                    &listen_ip,
-                    local_events_snapshot.clone(),
-                    Duration::from_millis(350),
-                ) {
-                    let source_peer = if remote.peer.trim().is_empty() {
-                        target.clone()
-                    } else {
-                        remote.peer.clone()
-                    };
-                    known_peers.insert(source_peer.clone());
-                    for mut event in remote.payload {
-                        // Namespace remote identity so local and remote sessions coexist.
-                        event.id = format!("remote:{}:{}", source_peer, event.id);
-                        event.user = format!("{}@{}", event.user, source_peer);
-                        event.updated_at_unix_ms = now_ms;
-                        remote_cache.insert(event.id.clone(), (event, now_ms));
+                let snapshot = local_events_snapshot.clone();
+                for attempt in 0..2 {
+                    match client.pull_once(
+                        &target,
+                        args.port,
+                        key,
+                        &listen_ip,
+                        snapshot.clone(),
+                        pull_timeout,
+                    ) {
+                        Ok(remote) => {
+                            let source_peer = if remote.peer.trim().is_empty() {
+                                target.clone()
+                            } else {
+                                remote.peer.clone()
+                            };
+                            known_peers.insert(source_peer.clone());
+                            for mut event in remote.payload {
+                                event.id = format!("remote:{}:{}", source_peer, event.id);
+                                event.user = format!("{}@{}", event.user, source_peer);
+                                event.updated_at_unix_ms = now_ms;
+                                remote_cache.insert(event.id.clone(), (event, now_ms));
+                            }
+                            break;
+                        }
+                        Err(_) => {
+                            if attempt == 0 {
+                                thread::sleep(Duration::from_millis(200));
+                            }
+                        }
                     }
                 }
             }
