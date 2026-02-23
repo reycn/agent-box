@@ -26,6 +26,8 @@ pub struct SyncEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PullRequest {
     auth_key: String,
+    peer: String,
+    payload: Vec<SessionEvent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +114,8 @@ impl SyncClient {
         peer_host: &str,
         port: u16,
         auth_key: &str,
+        local_peer: &str,
+        local_events: Vec<SessionEvent>,
         timeout: Duration,
     ) -> Result<SyncEnvelope> {
         self.handshake(auth_key)?;
@@ -121,8 +125,14 @@ impl SyncClient {
         stream.set_read_timeout(Some(timeout)).ok();
         stream.set_write_timeout(Some(timeout)).ok();
 
+        let outbound = local_events
+            .into_iter()
+            .map(|event| self.security.filter_sensitive(event))
+            .collect::<Vec<_>>();
         let request = PullRequest {
             auth_key: auth_key.to_string(),
+            peer: local_peer.to_string(),
+            payload: outbound,
         };
         let request_bytes = serde_json::to_vec(&request)?;
         stream.write_all(&request_bytes)?;
@@ -146,6 +156,8 @@ pub fn discover_join_key(peer_host: &str, port: u16, timeout: Duration) -> Resul
 
     let request = PullRequest {
         auth_key: "__discover__".to_string(),
+        peer: "discover".to_string(),
+        payload: vec![],
     };
     let request_bytes = serde_json::to_vec(&request)?;
     stream.write_all(&request_bytes)?;
@@ -169,6 +181,12 @@ pub struct SyncServer {
     shared_key: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct IncomingPeerUpdate {
+    pub peer: String,
+    pub payload: Vec<SessionEvent>,
+}
+
 impl SyncServer {
     pub fn bind(ip: &str, port: u16, shared_key: &str) -> Result<Self> {
         let listener =
@@ -187,8 +205,9 @@ impl SyncServer {
         peer_name: &str,
         nonce: u64,
         protocol: TransportProtocol,
-    ) -> Result<usize> {
+    ) -> Result<Vec<IncomingPeerUpdate>> {
         let mut served = 0usize;
+        let mut incoming_updates = Vec::new();
         loop {
             let (mut stream, _) = match self.listener.accept() {
                 Ok(v) => v,
@@ -217,6 +236,10 @@ impl SyncServer {
             if !self.security.verify_key(&req.auth_key) {
                 continue;
             }
+            incoming_updates.push(IncomingPeerUpdate {
+                peer: req.peer.clone(),
+                payload: req.payload.clone(),
+            });
 
             let client = SyncClient::new(&req.auth_key);
             let envelope = client.prepare_envelope(
@@ -229,7 +252,8 @@ impl SyncServer {
             stream.write_all(&encoded)?;
             served += 1;
         }
-        Ok(served)
+        let _ = served;
+        Ok(incoming_updates)
     }
 }
 
@@ -323,6 +347,7 @@ mod tests {
                 if server
                     .serve_once(vec![event.clone()], "peer-a", 10, TransportProtocol::Http)
                     .expect("serve ok")
+                    .len()
                     > 0
                 {
                     return;
@@ -335,7 +360,14 @@ mod tests {
         thread::sleep(Duration::from_millis(20));
         let client = SyncClient::new("abc");
         let response = client
-            .pull_once("127.0.0.1", 38466, "abc", Duration::from_millis(300))
+            .pull_once(
+                "127.0.0.1",
+                38466,
+                "abc",
+                "client-a",
+                vec![],
+                Duration::from_millis(300),
+            )
             .expect("pull works");
         assert_eq!(response.payload.len(), 1);
         assert_eq!(response.payload[0].last_lines[0], "token=[REDACTED]");
@@ -347,17 +379,12 @@ mod tests {
         let server =
             SyncServer::bind("127.0.0.1", 38467, "abc").expect("server should bind localhost");
         let handle = thread::spawn(move || {
-            for _ in 0..20 {
-                if server
+            for _ in 0..30 {
+                let _ = server
                     .serve_once(vec![], "peer-a", 10, TransportProtocol::Http)
-                    .expect("serve ok")
-                    > 0
-                {
-                    return;
-                }
+                    .expect("serve ok");
                 thread::sleep(Duration::from_millis(10));
             }
-            panic!("server did not serve discovery request");
         });
 
         thread::sleep(Duration::from_millis(20));

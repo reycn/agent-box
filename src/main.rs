@@ -14,12 +14,16 @@ use agent_box::{render_snapshot_with_frame, run_once, unix_ms_now};
 fn main() -> Result<()> {
     let session_unix_ms = unix_ms_now();
     let args = CliArgs::parse();
-    let listen_ip = if args.public {
+    let prefer_public_ip = args.public || args.peer.is_some();
+    let listen_ip = if prefer_public_ip {
         match detect_public_ip() {
             Ok(ip) => ip,
             Err(err) => {
-                eprintln!("warning: --public failed to resolve public IP ({err}); using 0.0.0.0");
-                "0.0.0.0".to_string()
+                eprintln!(
+                    "warning: public IP resolution failed ({err}); using configured bind IP {}",
+                    args.ip
+                );
+                args.ip.clone()
             }
         }
     } else {
@@ -35,8 +39,12 @@ fn main() -> Result<()> {
 
     if let Some(peer) = args.peer.as_deref() {
         let parsed = parse_peer(peer, session_unix_ms)?;
-        let mut effective_key = parsed.auth_key.clone();
-        if parsed.generated_auth_key {
+        let mut effective_key = if let Some(explicit) = args.key.as_deref() {
+            explicit.to_string()
+        } else {
+            parsed.auth_key.clone()
+        };
+        if parsed.generated_auth_key && args.key.is_none() {
             match discover_join_key(&parsed.host, args.port, Duration::from_millis(500)) {
                 Ok(discovered) => {
                     effective_key = discovered;
@@ -54,6 +62,9 @@ fn main() -> Result<()> {
         session_key = Some(effective_key.clone());
         let client = SyncClient::new(&effective_key);
         client.handshake(&effective_key)?;
+    } else if let Some(explicit_key) = args.key.as_deref() {
+        // Explicit key also defines local session sharing key without a join target.
+        session_key = Some(explicit_key.to_string());
     } else if !args.no_expose {
         // No passkey supplied at all in CLI input: generate one for join instructions.
         session_key = Some(generate_passkey_sha1(
@@ -68,7 +79,7 @@ fn main() -> Result<()> {
     let mut combined_store = RuntimeStateStore::default();
     let mut frame: usize = 0;
     let protocol = transport_from_args(args.protocol);
-    let bind_ip = if args.public {
+    let bind_ip = if prefer_public_ip {
         "0.0.0.0".to_string()
     } else {
         listen_ip.clone()
@@ -97,14 +108,24 @@ fn main() -> Result<()> {
         local_store.clear();
         run_once(&mut local_store);
         let local_events = local_store.all();
+        let local_events_snapshot = local_events.clone();
+        let mut pushed_from_peers = Vec::new();
 
         if let (Some(server), Some(key)) = (&sync_server, session_key.as_deref()) {
-            let _ = server.serve_once(
+            if let Ok(incoming) = server.serve_once(
                 local_events.clone(),
                 &listen_ip,
                 unix_ms_now(),
                 protocol,
-            );
+            ) {
+                for update in incoming {
+                    for mut event in update.payload {
+                        event.id = format!("remote:{}:{}", update.peer, event.id);
+                        event.user = format!("{}@{}", event.user, update.peer);
+                        pushed_from_peers.push(event);
+                    }
+                }
+            }
             // Keep an explicit handshake check in loop for deterministic auth behavior.
             let _ = SyncClient::new(key).handshake(key);
         }
@@ -113,10 +134,20 @@ fn main() -> Result<()> {
         for event in local_events {
             let _ = combined_store.upsert(event);
         }
+        for event in pushed_from_peers {
+            let _ = combined_store.upsert(event);
+        }
 
         if let (Some(host), Some(key)) = (peer_host.as_deref(), session_key.as_deref()) {
             let client = SyncClient::new(key);
-            if let Ok(remote) = client.pull_once(host, args.port, key, Duration::from_millis(350)) {
+            if let Ok(remote) = client.pull_once(
+                host,
+                args.port,
+                key,
+                &listen_ip,
+                local_events_snapshot,
+                Duration::from_millis(350),
+            ) {
                 for mut event in remote.payload {
                     // Prefix remote identity so local and remote sessions can coexist in one view.
                     event.id = format!("remote:{}:{}", host, event.id);

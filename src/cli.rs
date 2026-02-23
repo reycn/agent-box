@@ -33,6 +33,9 @@ pub struct CliArgs {
     #[arg(long, help = "Use detected public IP as bind/join IP")]
     pub public: bool,
 
+    #[arg(long, help = "Explicit session passkey for join/sync")]
+    pub key: Option<String>,
+
     #[arg(short = 'p', long, default_value_t = 8346)]
     pub port: u16,
 
@@ -141,6 +144,7 @@ mod tests {
         let args = parse_args_from(["agent-box"]);
         assert_eq!(args.ip, "127.0.0.1");
         assert!(!args.public);
+        assert!(args.key.is_none());
         assert_eq!(args.port, 8346);
         assert_eq!(args.interval, 3);
         assert_eq!(args.protocol, Protocol::Http);
@@ -150,6 +154,12 @@ mod tests {
     fn parses_public_flag() {
         let args = parse_args_from(["agent-box", "--public"]);
         assert!(args.public);
+    }
+
+    #[test]
+    fn parses_key_flag() {
+        let args = parse_args_from(["agent-box", "--key", "my-key"]);
+        assert_eq!(args.key.as_deref(), Some("my-key"));
     }
 
     #[test]
