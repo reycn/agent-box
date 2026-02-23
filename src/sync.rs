@@ -28,6 +28,11 @@ struct PullRequest {
     auth_key: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DiscoveryResponse {
+    auth_key: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct RetryPolicy {
     pub max_attempts: u32,
@@ -132,9 +137,36 @@ impl SyncClient {
     }
 }
 
+pub fn discover_join_key(peer_host: &str, port: u16, timeout: Duration) -> Result<String> {
+    let addr = resolve_addr(peer_host, port)?;
+    let mut stream = TcpStream::connect_timeout(&addr, timeout)
+        .map_err(|e| anyhow!("connect failed to {peer_host}:{port}: {e}"))?;
+    stream.set_read_timeout(Some(timeout)).ok();
+    stream.set_write_timeout(Some(timeout)).ok();
+
+    let request = PullRequest {
+        auth_key: "__discover__".to_string(),
+    };
+    let request_bytes = serde_json::to_vec(&request)?;
+    stream.write_all(&request_bytes)?;
+    stream.shutdown(Shutdown::Write).ok();
+
+    let mut bytes = Vec::new();
+    stream.read_to_end(&mut bytes)?;
+    if bytes.is_empty() {
+        return Err(anyhow!("empty discovery response from peer"));
+    }
+    let response: DiscoveryResponse = serde_json::from_slice(&bytes)?;
+    if response.auth_key.trim().is_empty() {
+        return Err(anyhow!("peer returned empty discovery key"));
+    }
+    Ok(response.auth_key)
+}
+
 pub struct SyncServer {
     listener: TcpListener,
     security: SecurityLayer,
+    shared_key: String,
 }
 
 impl SyncServer {
@@ -145,6 +177,7 @@ impl SyncServer {
         Ok(Self {
             listener,
             security: SecurityLayer::new(shared_key),
+            shared_key: shared_key.to_string(),
         })
     }
 
@@ -172,6 +205,15 @@ impl SyncServer {
                 Ok(v) => v,
                 Err(_) => continue,
             };
+            if req.auth_key == "__discover__" {
+                let resp = DiscoveryResponse {
+                    auth_key: self.shared_key.clone(),
+                };
+                let serialized = serde_json::to_vec(&resp)?;
+                stream.write_all(&serialized)?;
+                served += 1;
+                continue;
+            }
             if !self.security.verify_key(&req.auth_key) {
                 continue;
             }
@@ -216,7 +258,7 @@ mod tests {
 
     use crate::model::{AgentKind, SessionEvent, SessionStatus};
 
-    use super::{RetryPolicy, SyncClient, SyncServer, TransportProtocol};
+    use super::{discover_join_key, RetryPolicy, SyncClient, SyncServer, TransportProtocol};
 
     #[test]
     fn handshake_rejects_invalid_key() {
@@ -297,6 +339,31 @@ mod tests {
             .expect("pull works");
         assert_eq!(response.payload.len(), 1);
         assert_eq!(response.payload[0].last_lines[0], "token=[REDACTED]");
+        handle.join().expect("server thread joins");
+    }
+
+    #[test]
+    fn discover_join_key_returns_server_key() {
+        let server =
+            SyncServer::bind("127.0.0.1", 38467, "abc").expect("server should bind localhost");
+        let handle = thread::spawn(move || {
+            for _ in 0..20 {
+                if server
+                    .serve_once(vec![], "peer-a", 10, TransportProtocol::Http)
+                    .expect("serve ok")
+                    > 0
+                {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            panic!("server did not serve discovery request");
+        });
+
+        thread::sleep(Duration::from_millis(20));
+        let key =
+            discover_join_key("127.0.0.1", 38467, Duration::from_millis(300)).expect("discover");
+        assert_eq!(key, "abc");
         handle.join().expect("server thread joins");
     }
 }

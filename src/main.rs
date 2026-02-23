@@ -8,7 +8,7 @@ use clap::Parser;
 use agent_box::cli::{detect_public_ip, parse_peer, validate_bind, CliArgs};
 use agent_box::model::RuntimeStateStore;
 use agent_box::security::generate_passkey_sha1;
-use agent_box::sync::{SyncClient, SyncServer, TransportProtocol};
+use agent_box::sync::{discover_join_key, SyncClient, SyncServer, TransportProtocol};
 use agent_box::{render_snapshot_with_frame, run_once, unix_ms_now};
 
 fn main() -> Result<()> {
@@ -35,16 +35,25 @@ fn main() -> Result<()> {
 
     if let Some(peer) = args.peer.as_deref() {
         let parsed = parse_peer(peer, session_unix_ms)?;
+        let mut effective_key = parsed.auth_key.clone();
         if parsed.generated_auth_key {
-            println!(
-                "No passkey supplied for peer '{}'; generated SHA-1 passkey: {}",
-                parsed.host, parsed.auth_key
-            );
+            match discover_join_key(&parsed.host, args.port, Duration::from_millis(500)) {
+                Ok(discovered) => {
+                    effective_key = discovered;
+                    println!("Discovered peer passkey from '{}'.", parsed.host);
+                }
+                Err(err) => {
+                    println!(
+                        "No passkey supplied for peer '{}'; discovery failed ({err}), using generated fallback key.",
+                        parsed.host
+                    );
+                }
+            }
         }
         peer_host = Some(parsed.host.clone());
-        session_key = Some(parsed.auth_key.clone());
-        let client = SyncClient::new(&parsed.auth_key);
-        client.handshake(&parsed.auth_key)?;
+        session_key = Some(effective_key.clone());
+        let client = SyncClient::new(&effective_key);
+        client.handshake(&effective_key)?;
     } else if !args.no_expose {
         // No passkey supplied at all in CLI input: generate one for join instructions.
         session_key = Some(generate_passkey_sha1(
