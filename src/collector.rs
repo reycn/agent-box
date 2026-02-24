@@ -124,7 +124,7 @@ fn collect_local_process_sessions() -> Vec<SessionEvent> {
         sessions.push(SessionEvent {
             id: format!("proc-{pid}"),
             agent,
-            title: title_from_command(&command, agent, &cwd),
+            title: title_from_command(&command, agent, &cwd, pid),
             working_dir: cwd.clone(),
             user: user.clone(),
             status: SessionStatus::Running,
@@ -158,16 +158,31 @@ fn contains_exec_token(command: &str, needle: &str) -> bool {
         .any(|token| token == needle || token.ends_with(&format!("/{needle}")))
 }
 
-fn title_from_command(command: &str, agent: AgentKind, cwd: &str) -> String {
+fn title_from_command(command: &str, agent: AgentKind, cwd: &str, pid: u32) -> String {
     let title = match agent {
-        AgentKind::Claude => claude_title_from_command(command, cwd)
+        AgentKind::Claude => claude_title_from_command(command, cwd, pid)
+            .unwrap_or_else(|| summarize_command(command, 48)),
+        AgentKind::Codex => codex_title_from_command(command, cwd, pid)
             .unwrap_or_else(|| summarize_command(command, 48)),
         _ => summarize_command(command, 48),
     };
     truncate_keep_right(&title, 48)
 }
 
-fn claude_title_from_command(command: &str, cwd: &str) -> Option<String> {
+fn process_cwd(pid: u32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let cwd = std::path::Path::new("/proc").join(pid.to_string()).join("cwd");
+        std::fs::read_link(&cwd).ok().map(|p| p.display().to_string())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+fn claude_title_from_command(command: &str, cwd: &str, pid: u32) -> Option<String> {
     let tokens = command
         .split_whitespace()
         .map(normalize_token)
@@ -181,6 +196,10 @@ fn claude_title_from_command(command: &str, cwd: &str) -> Option<String> {
         if let Some(hint) = summarize_session_path(&path) {
             return Some(format!("claude {hint}"));
         }
+    }
+
+    if let Some(title) = title_from_claude_projects(pid) {
+        return Some(format!("claude {title}"));
     }
 
     let args_title = tokens
@@ -200,6 +219,101 @@ fn claude_title_from_command(command: &str, cwd: &str) -> Option<String> {
         .and_then(|v| v.to_str())
         .unwrap_or("session");
     Some(format!("claude {project}"))
+}
+
+fn title_from_claude_projects(pid: u32) -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let base = Path::new(&home).join(".claude").join("projects");
+    if !base.exists() {
+        return None;
+    }
+    let process_cwd = process_cwd(pid);
+    let mut best: Option<(std::time::SystemTime, String)> = None;
+
+    for project_dir in std::fs::read_dir(&base).ok()?.flatten() {
+        let sessions_dir = project_dir.path().join("sessions");
+        if !sessions_dir.is_dir() {
+            continue;
+        }
+        if let Some(ref cwd) = process_cwd {
+            let encoded = url_encode_path(cwd);
+            if project_dir.file_name().to_string_lossy() != encoded {
+                continue;
+            }
+        }
+        for entry in std::fs::read_dir(&sessions_dir).ok()?.flatten() {
+            let path = entry.path();
+            if path.extension().map_or(true, |e| e != "jsonl") {
+                continue;
+            }
+            let meta = std::fs::metadata(&path).ok()?;
+            let modified = meta.modified().ok()?;
+            let title = read_title_from_session_file(path.to_str()?)
+                .or_else(|| project_dir.file_name().to_str().map(String::from));
+            if let Some(t) = title {
+                if best.as_ref().map_or(true, |(m, _)| modified > *m) {
+                    best = Some((modified, t));
+                }
+            }
+        }
+        if process_cwd.is_some() && best.is_some() {
+            break;
+        }
+    }
+    best.map(|(_, t)| t)
+}
+
+fn url_encode_path(path: &str) -> String {
+    path.trim().replace('/', "-").replace(' ', "-")
+}
+
+fn codex_title_from_command(_command: &str, cwd: &str, pid: u32) -> Option<String> {
+    if let Some(title) = title_from_codex_sessions(pid) {
+        return Some(format!("codex {title}"));
+    }
+    let project = Path::new(cwd)
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or("session");
+    Some(format!("codex {project}"))
+}
+
+fn title_from_codex_sessions(pid: u32) -> Option<String> {
+    let _ = pid;
+    let home = std::env::var("HOME").ok()?;
+    let base = Path::new(&home).join(".codex").join("sessions");
+    if !base.exists() {
+        return None;
+    }
+    let mut best: Option<(std::time::SystemTime, String)> = None;
+
+    for path in walkdir_jsonl(&base) {
+        let meta = std::fs::metadata(&path).ok()?;
+        let modified = meta.modified().ok()?;
+        let title = read_title_from_session_file(path.to_str()?)
+            .or_else(|| path.file_stem().and_then(|s: &std::ffi::OsStr| s.to_str()).map(String::from));
+        if let Some(t) = title {
+            if best.as_ref().map_or(true, |(m, _)| modified > *m) {
+                best = Some((modified, t));
+            }
+        }
+    }
+    best.map(|(_, t)| t)
+}
+
+fn walkdir_jsonl(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.is_dir() {
+                out.extend(walkdir_jsonl(&path));
+            } else if path.extension().map_or(false, |e| e == "jsonl") {
+                out.push(path);
+            }
+        }
+    }
+    out
 }
 
 fn normalize_token(token: &str) -> String {
@@ -450,6 +564,7 @@ mod tests {
             "/opt/tools/claude this is a very very very very very very long command string with extra tail",
             AgentKind::Claude,
             "/tmp/project",
+            12345,
         );
         assert!(title.len() <= 48);
     }
@@ -483,7 +598,7 @@ mod tests {
         fs::write(&path, r#"{"title":"Bug bash - login flow"}"#).expect("write file");
 
         let cmd = format!("claude --session {}", path.display());
-        let title = claude_title_from_command(&cmd, "/tmp/project").expect("title");
+        let title = claude_title_from_command(&cmd, "/tmp/project", 12345).expect("title");
         assert!(title.contains("Bug bash - login flow"));
 
         let _ = fs::remove_file(&path);
